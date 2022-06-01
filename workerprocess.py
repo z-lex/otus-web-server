@@ -4,6 +4,7 @@ import logging
 import mimetypes
 import socket
 import typing as t
+import urllib.parse
 from email.utils import formatdate
 from http import HTTPStatus
 from multiprocessing import Process
@@ -11,7 +12,6 @@ from pathlib import Path
 
 from asyncserver import OtusAsyncServer, ReaderStream, WriterStream
 from httpclasses import Request, Response
-from tools import resolve_percents_in_http_target, split_query_from_http_target
 
 _logger = logging.getLogger(__name__)
 
@@ -40,12 +40,12 @@ class WorkerProcess(Process):
         super(WorkerProcess, self).__init__(target=self._server.serve_forever)
 
     def _get_content_for_target(self, request_target: str) -> t.Tuple[str, str, bytes]:
-        request_target, query = split_query_from_http_target(request_target)
+        parsed = urllib.parse.urlparse(request_target)
 
-        request_target = resolve_percents_in_http_target(request_target)
+        unquoted = urllib.parse.unquote(parsed.path, encoding="utf-8")
 
-        request_path = Path(request_target)
-        if request_target.endswith("/"):
+        request_path = Path(unquoted)
+        if unquoted.endswith("/"):
             request_path = request_path.joinpath("index.html")
 
         content_path = self._document_root.joinpath(request_path.relative_to("/")).resolve()
