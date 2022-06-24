@@ -1,37 +1,19 @@
 from __future__ import annotations
 
-import contextlib
 import heapq
 import logging
 import select
 import socket
 import time
 import typing as t
-from abc import ABC
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum
 from errno import EAGAIN, EBADF, ECONNABORTED, ECONNRESET, EINTR, ENOTCONN, EPIPE, ESHUTDOWN, \
     EWOULDBLOCK
 
 _DISCONNECTED = frozenset({ECONNRESET, ENOTCONN, ESHUTDOWN, ECONNABORTED, EPIPE, EBADF})
 
 _logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ConnCallbackCoroutine:
-    """ Dataclass for storing information about the coroutine created from the
-    ``on_connected`` callback argument passed to :class:`OtusAsyncServer`
-    """
-    coro: t.Coroutine
-    reader: ReaderStream
-    writer: WriterStream
-    waiting_for_sock: bool = False
-
-    def close_streams(self):
-        self.reader.close()
-        self.writer.close()
-
 
 EXCEPTIONS_SELECT_FLAGS = select.POLLERR | select.POLLHUP | select.POLLNVAL
 READING_SELECT_FLAGS = select.POLLIN | select.POLLPRI | EXCEPTIONS_SELECT_FLAGS
@@ -54,7 +36,6 @@ class SockInfo:
     accepting: bool = False
     readable_now: bool = False
     writable_now: bool = False
-    waiters: t.List[t.Tuple[float, ConnCallbackCoroutine]] = field(default_factory=list)
 
     def __post_init__(self):
         self.fd = self.sock.fileno()
@@ -75,62 +56,15 @@ class SockInfo:
         self.writable_now = False
 
 
-class CmdName(Enum):
-    READ = "read"
-    WRITE = "write"
-
-
-@dataclass
-class Command:
-    """ Represents action to be performed by the server loop when ``await`` is called on some
-    awaitable object.
-    """
-    cmd_name: CmdName
-    sock_info: SockInfo
-
-
-class AsyncSockWaiter(ABC):
-    """ Abstract class of the awaitable that sends a specific command to the server loop and
-    suspends the current coroutine until the socket changes its state to the desired state
-    """
-
-    #: command to be sent to the server loop
-    cmd: CmdName = None
-
-    #: desired socket state
-    sock_info_ready_attr: str = None
-
-    def __init__(self, sock_info: SockInfo):
-        self.sock_info = sock_info
-
-    def __await__(self):
-        if getattr(self.sock_info, self.sock_info_ready_attr, None) is True:
-            # release the coroutine immediately if the state is already set
-            n = yield
-        else:
-            n = yield Command(cmd_name=self.cmd, sock_info=self.sock_info)
-        return n
-
-
-class AsyncReadSockWaiter(AsyncSockWaiter):
-    """ Suspends the current coroutine until its :attr:`sock_info` becomes readable """
-    cmd = CmdName.READ
-    sock_info_ready_attr = "readable_now"
-
-
-class AsyncWriteSockWaiter(AsyncSockWaiter):
-    """ Suspends the current coroutine until its :attr:`sock_info` becomes writable """
-    cmd = CmdName.WRITE
-    sock_info_ready_attr = "writable_now"
-
-
 class AsyncStream(ABC):
     """ Abstract class of the asynchronous data stream """
-    waiter_cls = AsyncSockWaiter
 
     def __init__(self, sock_info: SockInfo):
         self.sock_info = sock_info
-        self.waiter = self.waiter_cls(self.sock_info)
+
+    @abstractmethod
+    def __await__(self):
+        pass
 
     def __repr__(self):
         return f"<{self.__class__.__name__}: fd={self.fd}>"
@@ -138,6 +72,14 @@ class AsyncStream(ABC):
     @property
     def fd(self):
         return self.sock_info.fd
+
+    @property
+    def readable_now(self):
+        return self.sock_info.readable_now
+
+    @property
+    def writable_now(self):
+        return self.sock_info.writable_now
 
     @property
     def closed(self) -> bool:
@@ -149,18 +91,25 @@ class AsyncStream(ABC):
 
 class ReaderStream(AsyncStream):
     """ Asynchronous socket reader """
-    waiter_cls = AsyncReadSockWaiter
+
+    def __await__(self):
+        if self.sock_info.readable_now:
+            # release the coroutine immediately if the state is already set
+            n = yield
+        else:
+            n = yield "read"
+        return n
 
     async def read(self, n: int = -1) -> bytes:
-        await self.waiter
+        await self
         try:
             data = self.sock_info.sock.recv(n)
             if not data:
-                self.close()
+                self.sock_info.close()
                 data = b""
         except OSError as e:
             if e.args[0] in _DISCONNECTED:
-                self.close()
+                self.sock_info.close()
                 data = b""
             else:
                 raise
@@ -171,10 +120,17 @@ class ReaderStream(AsyncStream):
 
 class WriterStream(AsyncStream):
     """ Asynchronous socket writer """
-    waiter_cls = AsyncWriteSockWaiter
+
+    def __await__(self):
+        if self.sock_info.writable_now:
+            # release the coroutine immediately if the state is already set
+            n = yield
+        else:
+            n = yield "write"
+        return n
 
     async def write(self, data: bytes) -> int:
-        await self.waiter
+        await self
         try:
             bytes_sent = self.sock_info.sock.send(data)
         except OSError as e:
@@ -189,6 +145,22 @@ class WriterStream(AsyncStream):
             self.sock_info.writable_now = False
 
         return bytes_sent
+
+
+@dataclass
+class ConnCallbackCoroutine:
+    """ Dataclass for storing information about the coroutine created from the
+    ``on_connected`` callback argument passed to :class:`OtusAsyncServer`
+    """
+    coro: t.Coroutine
+    reader: ReaderStream
+    writer: WriterStream
+    waiting_for_reader: bool = False
+    waiting_for_writer: bool = False
+
+    def close_streams(self):
+        self.reader.close()
+        self.writer.close()
 
 
 class OtusAsyncServer:
@@ -223,7 +195,6 @@ class OtusAsyncServer:
 
         self._callback = on_connected
         self._callback_coros: t.List[t.Tuple[float, ConnCallbackCoroutine]] = []
-        # self._callback_coros: t.Deque[ConnCallbackCoroutine] = deque()
 
     def _accept(self, info: SockInfo) -> None:
         # add new sockets to socket map
@@ -255,10 +226,9 @@ class OtusAsyncServer:
             coro: ConnCallbackCoroutine = ConnCallbackCoroutine(
                 coro=self._callback(reader, writer), reader=reader, writer=writer)
             heapq.heappush(self._callback_coros, (time.time(), coro))
-            # self._callback_coros += [coro]
             _logger.debug("coro %s created", coro)
 
-    def _epoll_poller(self, timeout=0.0) -> t.Generator[SockInfo, None, None]:
+    def _epoll_poller(self, timeout=0.0) -> None:
         """A poller which uses epoll(), supported on Linux 2.5.44 and newer."""
         pollster = select.epoll()
 
@@ -266,7 +236,6 @@ class OtusAsyncServer:
         info: SockInfo
         if len(self._socket_map) > 0:
             for fd, info in self._socket_map.items():
-                # info.clear_ready_flags()
                 pollster.register(fd, info.select_flags)
             try:
                 r = pollster.poll(timeout)
@@ -289,8 +258,6 @@ class OtusAsyncServer:
                 if flags & select.POLLOUT:
                     info.writable_now = True
 
-                yield info
-
     def serve_forever(self, timeout: float = 300.0):
         """ Server main loop """
         iter = 0
@@ -299,20 +266,7 @@ class OtusAsyncServer:
             _logger.debug("serve_forever iteration %i, socket fds: %s",
                           iter, list(self._socket_map.keys()))
 
-            sock_info: SockInfo
-            for sock_info in self._epoll_poller(timeout):
-                if sock_info.readable_now or sock_info.writable_now:
-                    _logger.debug("iter %i on sock fd = %i: readable: %i, writable: %i", iter,
-                                  sock_info.fd, sock_info.readable_now, sock_info.writable_now)
-                    # release waiter coroutines
-                    while len(sock_info.waiters):
-                        # w = sock_info.waiters.pop()
-                        # get the waiter with minimum timestamp
-                        _, w = heapq.heappop(sock_info.waiters)
-                        with contextlib.suppress(StopIteration):
-                            w.coro.send(None)
-                        w.waiting_for_sock = False
-                        _logger.debug("coro has finished waiting on %s: %s", sock_info.fd, w)
+            self._epoll_poller(timeout)
 
             if len(self._callback_coros):
                 cinfo: ConnCallbackCoroutine
@@ -320,7 +274,7 @@ class OtusAsyncServer:
                 _, cinfo = heapq.heappop(self._callback_coros)
                 try:
                     # don't unblock if the coro waits for socket
-                    if not cinfo.waiting_for_sock:
+                    if not cinfo.waiting_for_reader and not cinfo.waiting_for_writer:
                         result = cinfo.coro.send(None)
 
                         # interrupt manually if reader or writer closed
@@ -328,12 +282,25 @@ class OtusAsyncServer:
                             _logger.debug("socket closed. interrupting coroutine")
                             raise StopIteration
 
-                        if isinstance(result, Command):
-                            if result.cmd_name in (CmdName.READ, CmdName.WRITE):
-                                heapq.heappush(result.sock_info.waiters, (time.time(), cinfo))
-                                cinfo.waiting_for_sock = True
-                                _logger.debug("coro suspended on '%s' from %s: %s",
-                                              result.cmd_name.value, result.sock_info.fd, cinfo)
+                        if result == "read":
+                            cinfo.waiting_for_reader = True
+                            _logger.debug("coro suspended on read from %s: %s",
+                                          cinfo.reader.fd, cinfo)
+                        elif result == "write":
+                            cinfo.waiting_for_writer = True
+                            _logger.debug("coro suspended on write from %s: %s",
+                                          cinfo.writer.fd, cinfo)
+                    else:
+                        if cinfo.waiting_for_reader and cinfo.reader.readable_now or \
+                                cinfo.waiting_for_writer and cinfo.writer.writable_now:
+                            cinfo.waiting_for_reader = False
+                            cinfo.waiting_for_writer = False
+                            _logger.debug(
+                                "iter %i on sock fd = %i: readable: %i, writable: %i", iter,
+                                cinfo.reader.fd if cinfo.reader.readable_now else cinfo.writer.fd,
+                                cinfo.reader.readable_now, cinfo.writer.writable_now
+                            )
+                            cinfo.coro.send(None)
 
                     # push coroutine with the new timestamp
                     heapq.heappush(self._callback_coros, (time.time(), cinfo))
