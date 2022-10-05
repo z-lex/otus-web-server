@@ -93,36 +93,66 @@ class ReaderStream(AsyncStream):
     """ Asynchronous socket reader """
 
     def __await__(self):
-        if self.sock_info.readable_now:
+        if self.readable_now:
             # release the coroutine immediately if the state is already set
             n = yield
         else:
             n = yield "read"
         return n
 
-    async def read(self, n: int = -1) -> bytes:
+    async def read(self, n: int = 65536) -> bytes:
         await self
+        data = b""
         try:
             data = self.sock_info.sock.recv(n)
             if not data:
-                self.sock_info.close()
-                data = b""
+                self.close()
         except OSError as e:
             if e.args[0] in _DISCONNECTED:
-                self.sock_info.close()
-                data = b""
+                self.close()
             else:
                 raise
         finally:
             self.sock_info.readable_now = False
         return data
 
+    async def readuntil(self, max_buf_size: int = 65536, chunk_size: int = 65536,
+                        sep: bytes = b"\r\n\r\n") -> bytes:
+        """ Read data asynchronously from the stream until separator is received.
+
+        :param max_buf_size:
+        :param chunk_size:
+        :param sep: separator byte string
+        :return: resulting data
+
+        :raises OverflowError: if the size of the received data exceeds ``max_buf_size``
+        :raises ConnectionAbortedError: if the connection closed before ``sep`` is received
+        :raises OSError: if an unhandled socket error occurred
+        """
+        if chunk_size > max_buf_size:
+            chunk_size = max_buf_size
+
+        data: bytes = b""
+        bytes_read: int = 0
+        while not self.closed and not data.endswith(sep):
+            chunk = await self.read(chunk_size)
+            _logger.debug("read request chunk: %s", chunk)
+            bytes_read += len(chunk)
+            if bytes_read > max_buf_size:
+                raise OverflowError
+            data += chunk
+
+        if not data.endswith(sep):
+            raise ConnectionAbortedError
+
+        return data.rstrip(sep)
+
 
 class WriterStream(AsyncStream):
     """ Asynchronous socket writer """
 
     def __await__(self):
-        if self.sock_info.writable_now:
+        if self.writable_now:
             # release the coroutine immediately if the state is already set
             n = yield
         else:
@@ -142,9 +172,26 @@ class WriterStream(AsyncStream):
             else:
                 raise
         finally:
-            self.sock_info.writable_now = False
+            if self.closed:
+                self.sock_info.writable_now = False
 
         return bytes_sent
+
+    async def writeall(self, data: bytes) -> None:
+        """ Like :meth:`write`, but continues to write data to the stream until either entire
+        ``data`` buffer has been sent or an error occurs.
+
+        :raises ConnectionAbortedError: if the connection was closed before all data is sent
+        :raises OSError: if an unhandled socket error occurred
+        """
+        bytes_sent = 0
+        bytes_to_send = len(data)
+
+        while bytes_sent < bytes_to_send and not self.closed:
+            bytes_sent += await self.write(data[bytes_sent:])
+
+        if bytes_sent < bytes_to_send:
+            raise ConnectionAbortedError
 
 
 @dataclass
@@ -234,29 +281,28 @@ class OtusAsyncServer:
 
         fd: int
         info: SockInfo
-        if len(self._socket_map) > 0:
-            for fd, info in self._socket_map.items():
-                pollster.register(fd, info.select_flags)
-            try:
-                r = pollster.poll(timeout)
-            except select.error as err:
-                if err.args[0] != EINTR:
-                    raise
-                r = []
+        for fd, info in self._socket_map.items():
+            pollster.register(fd, info.select_flags)
+        try:
+            r = pollster.poll(timeout)
+        except select.error as err:
+            if err.args[0] != EINTR:
+                raise
+            r = []
 
-            for fd, flags in r:
-                info = self._socket_map.get(fd)
-                if info is None:
+        for fd, flags in r:
+            info = self._socket_map.get(fd)
+            if info is None:
+                continue
+
+            # update socket state
+            if flags & select.POLLIN:
+                if info.accepting:
+                    self._accept(info)
                     continue
-
-                # update socket state
-                if flags & select.POLLIN:
-                    if info.accepting:
-                        self._accept(info)
-                        continue
-                    info.readable_now = True
-                if flags & select.POLLOUT:
-                    info.writable_now = True
+                info.readable_now = True
+            if flags & select.POLLOUT:
+                info.writable_now = True
 
     def serve_forever(self, timeout: float = 300.0):
         """ Server main loop """

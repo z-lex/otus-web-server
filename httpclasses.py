@@ -7,6 +7,7 @@ from http import HTTPStatus
 _logger = logging.getLogger(__name__)
 
 DEFAULT_HTTP_VERSION: str = "HTTP/1.1"
+CONTENT_SEPARATOR: bytes = b"\r\n\r\n"
 
 
 class HTTPMessage:
@@ -71,14 +72,9 @@ class Response(HTTPMessage):
         # have a 1xx (Informational) status code."
         self.headers["Connection"] = "close"
 
-    def set_content(self, data: bytes, content_type: str, enc: t.Optional[str] = None,
-                    head_request: bool = False):
-        if head_request:
-            self.content = b""
-        else:
-            self.content = data
+    def set_content_info(self, length: int, content_type: str, enc: t.Optional[str] = None):
         self.headers["Content-Type"] = content_type
-        self.headers["Content-Length"] = str(len(data))
+        self.headers["Content-Length"] = length
         if enc is not None:
             self.headers["Content-Encoding"] = enc
 
@@ -86,8 +82,9 @@ class Response(HTTPMessage):
         # update start line
         self.start_line = " ".join([self.http_version, str(self.status.value), self.status.name])
         data = super(Response, self).as_bytes(encoding)
+        data += CONTENT_SEPARATOR
 
         # append binary content
         if self.content is not None:
-            data += b"\r\n\r\n" + self.content
+            data += self.content
         return data

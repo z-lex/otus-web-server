@@ -39,7 +39,7 @@ class WorkerProcess(Process):
         self._server = OtusAsyncServer(accepting_socket, self._client_connected_cb)
         super(WorkerProcess, self).__init__(target=self._server.serve_forever)
 
-    def _get_content_for_target(self, request_target: str) -> t.Tuple[str, str, bytes]:
+    def _get_content_info_for_target(self, request_target: str) -> t.Tuple[str, str, Path]:
         parsed = urllib.parse.urlparse(request_target)
 
         unquoted = urllib.parse.unquote(parsed.path, encoding="utf-8")
@@ -62,14 +62,32 @@ class WorkerProcess(Process):
             # "The "octet-stream" subtype is used to indicate that a body contains arbitrary
             # binary data."
             mtype = "application/octet-stream"
-        with open(content_path, "rb") as f:
-            data = f.read()
 
-        return mtype, enc, data
+        return mtype, enc, content_path
+
+    @staticmethod
+    def _read_content_data(content_path: Path, chunk_size: int = 128) -> t.Generator[bytes]:
+        with open(content_path, "rb") as f:
+            while True:
+                data = f.read(chunk_size)
+                if data == b"":
+                    break
+                yield data
 
     async def _client_connected_cb(self, reader: ReaderStream, writer: WriterStream):
 
-        data: bytes = await reader.read(self.MAX_REQUEST_SIZE)
+        try:
+            data: bytes = await reader.readuntil(max_buf_size=self.MAX_REQUEST_SIZE,
+                                                 chunk_size=32, sep=b"\r\n\r\n")
+        except Exception as e:
+            if isinstance(e, OverflowError):
+                _logger.error("cant receive all data, request is too big")
+            elif isinstance(e, ConnectionAbortedError):
+                _logger.error("request is incomplete")
+            else:
+                _logger.exception("an unknown error occurred while receiving data")
+            return
+
         _logger.debug("received data len: '%i'", len(data))
         if not len(data):
             return
@@ -88,9 +106,13 @@ class WorkerProcess(Process):
         response = Response()
         response.status = status
 
+        content_gen: t.Optional[t.Generator[bytes]] = None
+
         if request and response.status == HTTPStatus.OK:
             try:
-                content_type, enc, content = self._get_content_for_target(request.request_target)
+                content_type, enc, content_path = \
+                    self._get_content_info_for_target(request.request_target)
+                content_length = content_path.stat().st_size
             except FileNotFoundError:
                 response.status = HTTPStatus.NOT_FOUND
             except PermissionError:
@@ -98,11 +120,25 @@ class WorkerProcess(Process):
             except ValueError:
                 response.status = HTTPStatus.BAD_REQUEST
             else:
-                response.set_content(content, content_type, enc, request.method == "HEAD")
+                response.set_content_info(content_length, content_type, enc)
+                if request.method == "GET":
+                    content_gen = self._read_content_data(content_path)
 
         # sending response
         response.headers["Date"] = formatdate(usegmt=True)
         response.headers["Server"] = self.SERVER_NAME
         response_data: bytes = response.as_bytes()
-        await writer.write(response_data)
-        _logger.debug("response sent: %s", response_data)
+        try:
+            await writer.writeall(response_data)
+
+            # sending binary content by chunks
+            if content_gen:
+                for chunk in content_gen:
+                    await writer.writeall(chunk)
+
+        except ConnectionAbortedError:
+            _logger.error("can't write header data, connection was interrupted")
+        except Exception:
+            _logger.exception("an unknown error occurred during sending data")
+        else:
+            _logger.debug("response sent: %s", response_data)
